@@ -1,0 +1,9 @@
+# Project exclude paths
+/.idea/
+/cmake-build-debug-remote-client/
+/cmake-build-debug-remote-host/
+/cmake-build-release-remote-client/
+/cmake-build-release-remote-host/
+
+
+CMakeLists.txt
