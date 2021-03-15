@@ -1,204 +1,275 @@
 #include <iostream>
-#include <fstream>
 #include <wiringPi.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <thread>
+#include <mutex>
+#include <list>
+#include <csignal>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-pragmas"
 #pragma ide diagnostic ignored "EndlessLoop"
 
-#define PORT 9669
-
-#define LED 8
-#define BUTTON 9
-
-using namespace std;
-
-enum eHostname
+namespace domo
 {
-	HOST,
-	CLIENT
-}hostname;
-
-int sock;
-char buffer[1024] = {0};
-
-bool oldButtonStatus;
-bool stateLED;
-
-void init()
-{
-	//Define if we are on the host or client raspberry
-	ifstream hostFile;
-	hostFile.open("/etc/hostname");
-
-	if(hostFile.is_open())
+	struct client
 	{
-		string line;
-		getline(hostFile, line);
-		cout << line << endl;
-
-		if(line == "domohost")
+		client(int _socket, std::thread _thread)
 		{
-			hostname = HOST;
-		}
-		else if(line == "domoclient")
-		{
-			hostname = CLIENT;
+			socket = _socket;
+			tReading = std::move(_thread);
 		}
 
-		hostFile.close();
-	}
-	else cout << "WARN : Error open hostname file !" << endl;
+		int socket;
+		std::thread tReading;
+	};
 
-	wiringPiSetup();
+	bool _server;
+	int _port;
 
-	if(hostname == HOST)
+	std::list<client> _clientList;
+	int _serverSocket;
+
+	char _buffer[1024] = {0};
+	std::list<std::string> msgBuffer;
+
+	std::thread tAcceptClient;
+	std::thread tReading;
+
+	std::mutex m;
+
+	char _led;
+	char _button;
+
+	bool _oldButtonStatus;
+	bool _stateLED;
+
+	sockaddr *sockAddrCast(sockaddr_in &_sockIn)
 	{
-		pinMode (LED, OUTPUT);
-		digitalWrite(LED, LOW);
-
+		return static_cast<sockaddr *>(static_cast<void *>(&_sockIn));
 	}
-	else if(hostname == CLIENT)
+
+	__sighandler_t SignalInterrupt(int signum, char test)
 	{
-		pinMode (BUTTON, INPUT);
-		oldButtonStatus = digitalRead(BUTTON);
+		std::cout << "\nCaught signal " << signum << std::endl;
+
+		if(_server)
+		{
+			for (auto &_client : _clientList)
+			{
+				shutdown(_client.socket, 2);
+				_client.tReading.join();
+			}
+			tAcceptClient.join();
+		}
+		else
+		{
+			shutdown(_serverSocket, 2);
+			tReading.join();
+		}
+		exit(signum);
+	}
+
+	void Initialisation(int argc, char *argv[])
+	{
+		signal(SIGINT, reinterpret_cast<__sighandler_t>(SignalInterrupt));
+
+		_server = false;
+		_port = 9669;
+
+		if (argc > 1)
+		{
+			for (int idxArg = 1; idxArg < argc; ++idxArg)
+			{
+				std::string tmp = argv[idxArg];
+				size_t line = tmp.find_first_of('-');
+
+				bool keepLoop = line != std::string::npos;
+
+				while (keepLoop)
+				{
+					size_t idxEnd = tmp.find_first_of('-', line + 1);
+					if (idxEnd == std::string::npos)
+					{
+						keepLoop = false;
+						idxEnd = tmp.size() + 1;
+					}
+
+					std::string arg = tmp.substr(line, (idxEnd - 1) - line);
+					if (arg == "-server")
+					{
+						_server = true;
+					}
+
+					line = idxEnd;
+				}
+			}
+		}
+
+		wiringPiSetup();
+
+		_led = 8;
+		_button = 9;
+
+		/*if(server)
+		{
+			pinMode (_led, OUTPUT);
+			digitalWrite(_led, LOW);
+
+		}
+		else
+		{
+			pinMode (_button, INPUT);
+			oldButtonStatus = digitalRead(_button);
+		}*/
+	}
+
+	void TCPHost()
+	{
+		sockaddr_in _sin{};
+		int _socket;
+
+		if ((_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		{
+			std::cerr << "cant initialize socket error " << errno << std::endl;
+			shutdown(_socket, 2);
+			exit(errno);
+		}
+
+		_sin.sin_family = AF_INET;
+		_sin.sin_addr.s_addr = htonl(INADDR_ANY);
+		_sin.sin_port = htons(_port);
+
+		if (bind(_socket, sockAddrCast(_sin), sizeof(_sin)) < 0)
+		{
+			std::cerr << "cant bind socket" << std::endl;
+			shutdown(_socket, 2);
+			exit(errno);
+		}
+
+		listen(_socket, 0);
+
+		std::cout << "waiting for client to connect..." << std::endl;
+
+		tAcceptClient = std::thread([_sin, _socket]()
+			{
+				socklen_t _sinLength = sizeof(_sin);
+				int clientSocket;
+				while (true)
+				{
+					if ((clientSocket = accept(_socket,	(sockaddr *) &_sin, &_sinLength)) <	0)
+					{
+
+						std::lock_guard<std::mutex> l(m);
+						std::cerr << "accept" << std::endl;
+						shutdown(_socket, 2);
+						exit(EXIT_FAILURE);
+					}
+					else
+					{
+						std::lock_guard<std::mutex> l(m);
+						client newClient = client(clientSocket,
+								std::thread([clientSocket]()
+								{
+									while (true)
+									{
+										std::lock_guard<std::mutex> l(m);
+										read(clientSocket, _buffer, sizeof(_buffer));
+										std::cout << _buffer << std::endl;
+
+										std::string msg(_buffer);
+										if(msg == "Hello from client")
+										{
+											msg = "Hello from server";
+											send(clientSocket, msg.c_str(), msg.size(), 0);
+											std::cout << "Hello message send" << std::endl;
+										}
+									}
+								}));
+						_clientList.push_back(std::move(newClient));
+						std::cout << "client connected" << std::endl;
+					}
+				}
+			});
+	}
+
+	void TCPClient()
+	{
+		sockaddr_in _sin{};
+
+		if ((_serverSocket = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+		{
+			printf("cant initialize socket error %d\n", errno);
+			shutdown(_serverSocket, 2);
+			exit(EXIT_FAILURE);
+		}
+
+		_sin.sin_family = AF_INET;
+		_sin.sin_addr.s_addr = inet_addr("192.168.0.33");
+		_sin.sin_port = htons(_port);
+
+		if (connect(_serverSocket, (struct sockaddr *) &_sin, sizeof(_sin)) < 0)
+		{
+			std::cerr << "Connection Failed" << std::endl;
+			shutdown(_serverSocket, 2);
+			exit(EXIT_FAILURE);
+		}
+
+		std::string hello = "Hello from client";
+		send(_serverSocket, hello.c_str(), hello.size(), 0);
+
+		std::cout << "Hello message send" << std::endl;
+
+		tReading = std::thread([]()
+			{
+				while (true)
+				{
+					std::lock_guard<std::mutex> l(m);
+					read(_serverSocket, _buffer, sizeof(_buffer));
+					std::cout << _buffer << std::endl;
+				}
+			});
+		std::cout << _buffer << std::endl;
 	}
 }
 
-void TCPHost()
+int main(int argc, char *argv[])
 {
-	int server_fd;
-	struct sockaddr_in address{};
-	int opt = 1;
-	int addrlen = sizeof(address);
+	domo::Initialisation(argc, argv);
 
-	// Creating socket file descriptor
-	if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0)
+	if (domo::_server)
 	{
-		perror("socket failed");
-		exit(EXIT_FAILURE);
-	}
-
-	// Forcefully attaching socket to the port 8080
-	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
-				   &opt, sizeof(opt)))
+		domo::TCPHost();
+	} else
 	{
-		perror("setsockopt");
-		exit(EXIT_FAILURE);
-	}
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = INADDR_ANY;
-	address.sin_port = htons( PORT );
-
-	// Forcefully attaching socket to the port 8080
-	if (bind(server_fd, (struct sockaddr *)&address,
-			 sizeof(address))<0)
-	{
-		perror("bind failed");
-		exit(EXIT_FAILURE);
-	}
-	if (listen(server_fd, 3) < 0)
-	{
-		perror("listen");
-		exit(EXIT_FAILURE);
-	}
-	if ((sock = accept(server_fd, (struct sockaddr *)&address,
-							 (socklen_t*)&addrlen))<0)
-	{
-		perror("accept");
-		exit(EXIT_FAILURE);
-	}
-
-	string hello = "Hello from server";
-
-	read( sock , buffer, sizeof(buffer));
-	printf("%s\n",buffer );
-
-	send(sock , hello.c_str() , hello.size() , 0 );
-	printf("Hello message sent\n");
-}
-
-void TCPClient()
-{
-	sockaddr_in serv_addr{};
-
-	if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-	{
-		printf("\n Socket creation error \n");
-		exit(EXIT_FAILURE);
-	}
-
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(PORT);
-
-	// Convert IPv4 and IPv6 addresses from text to binary form
-	if(inet_pton(AF_INET, "192.168.0.40", &serv_addr.sin_addr)<=0)
-	{
-		printf("\nInvalid address/ Address not supported \n");
-		exit(EXIT_FAILURE);
-	}
-
-	if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-	{
-		printf("\nConnection Failed \n");
-		exit(EXIT_FAILURE);
-	}
-
-	string hello = "Hello from client";
-
-	send(sock , hello.c_str(), hello.size() , 0 );
-	printf("Hello message sent\n");
-
-	read(sock , buffer, sizeof(buffer));
-	printf("%s\n", buffer);
-}
-
-int main() //int argc, char const *argv[])
-{
-	init();
-
-	if(hostname == HOST)
-	{
-		TCPHost();
-
-		stateLED = digitalRead(LED);
-		cout << stateLED << endl;
-		send(sock, &stateLED, sizeof(bool), 0);
-	}
-	else if (hostname == CLIENT)
-	{
-		TCPClient();
-
-		recv(sock, buffer, sizeof(buffer), 0);
-		stateLED = buffer[0];
-
-		cout << stateLED << endl;
+		domo::TCPClient();
 	}
 
 	while(true)
 	{
-		if(hostname == HOST)
-		{
-			recv(sock, buffer, sizeof(buffer), 0);
-			stateLED = buffer[0];
-
-			digitalWrite(LED, stateLED);
-		}
-		else if(hostname == CLIENT)
-		{
-
-			if(digitalRead(BUTTON) == 0 && oldButtonStatus == 1)
-			{
-				stateLED = !stateLED;
-				send(sock, &stateLED, sizeof(bool), 0);
-			}
-
-			oldButtonStatus = digitalRead(BUTTON);
-		}
+//		if(_server)
+//		{
+//			recv(_socket, buffer, sizeof(buffer), 0);
+//			_stateLED = buffer[0];
+//			cout << "msg receive : " << _stateLED << endl;
+//
+//			digitalWrite(_led, _stateLED);
+//		}
+//		else
+//		{
+//
+//			if(digitalRead(_button) == 0 && _oldButtonStatus == 1)
+//			{
+//				_stateLED = !_stateLED;
+//				send(_socket, &_stateLED, sizeof(_stateLED), 0);
+//				cout << "msg send : " << _stateLED << endl;
+//			}
+//
+//			_oldButtonStatus = digitalRead(_button);
+//		}
 	}
-}
 
-#pragma clang diagnostic pop
+	return 0;
+}
